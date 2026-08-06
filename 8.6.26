@@ -1,0 +1,89 @@
+/* Later me problems:
+  - add non vertical movment (rocket tilting and thrusting in that direction after takeoff and flight)
+*/
+//bilaries
+#include <Servo.h>
+#include <Wire.h>
+#include "SparkFun_BMP581_Arduino_Library.h"
+#include <cmath>
+#include <ICM_20948.h>
+
+//variables and constants
+const float ApogeeFT = 800; //CHANGE THIS!!! (apogee in feet)
+const float Apogee = ApogeeFT * 0.3048; //DON'T CHANGE THIS!!! (changing feet into meters)
+const double PI = 3.14159265358979323846; //Pi for later calculations :smiley:
+float cHeight; //current height
+float cVelocity; //current velocity
+float cTemp; // temp in celcius (ik i butchered the spelling. leave me alone)
+float airPressure; //in pascals
+const float mDiameter = 2.6; //Rocket's Max Diameter in inches
+const float frontalArea = (((mDiameter * 0.0254)/2) * ((mDiameter * 0.0254)/2)) * PI;
+const float rocketGMass = 614; //in grams
+const float rocketKMass = rocketGMass / 1000;
+const float dragCoefficient = 0.25; // JUST A PLACEHOLDER!!! PLEASE CHANGE!!
+float pHeight; //predicted height
+float pVelocity; //predicted velocity
+float airDensity; 
+float dragForce; // force in newtons
+float pAcceleration; //Acceleration for the Simulation
+float netForce; //downward force of rocket
+const float dt = 0.01; //delta time (seconds)
+const float maxServoAngle = 90;
+const float minServoAngle = 0;
+
+//Servo + Sensors
+BMP581 pressureSensor;
+ICM_20948_I2C myICM;
+Servo Airbrakes;
+int pos = 0;
+
+
+void setup() {
+   
+  serial.begin(115200);
+  serial.println("IM FREEEE");
+  pinMode(LED_BUILTIN, OUTPUT);
+  Airbreaks.attach(2);
+
+
+}
+
+void loop() {
+
+  //sensor code
+
+
+
+  //updates to height and velocity and acceleration and stuff
+
+  //update airDensity
+
+  airDensity = airPressure/(287.052874 * (cTemp + 273.15)); // p = Pbar/(R*T)
+
+  //prediction time
+
+  pHeight = cHeight;
+  pVelocity = cVelocity;
+
+  while (pVelocity > 0.1f){
+
+    dragForce = 0.5 * (airDensity * dragCoefficient * frontalArea * (pVelocity * pVelocity)); // Drag Calculations in Newtons
+    netForce = (rocketKMass * 9.81) + dragForce;
+    pAcceleration = -(netForce / rocketKMass);
+    pHeight = pHeight + (pVelocity * dt);
+    pVelocity = pVelocity + (pAcceleration * dt);
+
+  //Servo acutation
+  
+    if (pHeight > Apogee){
+      for (pos = minServoAngle; pos <= maxServoAngle; pos += 5) {
+    Airbreaks.write(pos);
+      }
+    else {
+      for (pos = maxServoAngle; pos <= minServoAngle; pos += 5) {
+    Airbreaks.write(pos);
+    }
+    }
+
+  }
+}
