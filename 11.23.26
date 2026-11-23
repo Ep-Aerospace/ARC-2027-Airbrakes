@@ -1,0 +1,484 @@
+/*
+  ACTIVE AIRBRAKE FLIGHT COMPUTER
+  Teensy 4.0 + BMP581 (baro) + ICM-20948 (accel) + servo + SPI microSD
+
+  HOW IT WORKS (big picture)
+  1. On the pad: measure ground pressure and what "1 g" reads on the accelerometer.
+  2. Every loop (100 Hz): a Kalman filter blends the accelerometer (fast, drifts)
+     with the barometer (slow, noisy) to get a clean height and velocity.
+  3. In coast: predict apogee from height + velocity + a drag estimate.
+     Find the smallest brake deployment (0 to 1) that makes predicted apogee = target.
+  4. Move the servo there (speed limited), and repeat 100 times a second.
+  5. Log everything to the SD card.
+
+  LIBRARIES (Arduino Library Manager):
+    - "SparkFun BMP581 Arduino Library"
+    - "SparkFun 9DoF IMU Breakout - ICM 20948 - Arduino Library"
+    - Servo and SD come with Teensyduino.
+
+  WIRING:
+    I2C : SDA = pin 18, SCL = pin 19  (both sensors)
+    SD  : MOSI 11, MISO 12, SCK 13, CS = pin 10
+    Servo signal = pin 2  (confirm against your schematic)
+*/
+
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Servo.h>
+#include "SparkFun_BMP581_Arduino_Library.h"
+#include "ICM_20948.h"
+
+// =====================================================================
+//  SETTINGS YOU WILL TUNE
+// =====================================================================
+
+// ---- Goal ----
+const float TARGET_APOGEE_FT = 800.0f;
+
+// ---- Pins ----
+const int SERVO_PIN = 2;   // from last year's code; confirm against your final schematic
+const int SD_CS_PIN = 10;
+const int BUTTON_PIN = 4;                 // *** CHANGE to the pin your zero button is wired to ***
+const bool BUTTON_ACTIVE_LOW = true;      // true = button connects pin to GND when pressed
+
+// ---- Servo ----
+const int   SERVO_RETRACTED_DEG = 0;     // angle where brakes are fully closed
+const int   SERVO_DEPLOYED_DEG  = 70;    // angle where brakes are fully open (last year's code capped at 70)
+const float SERVO_SPEED_DEG_PER_S = 300; // max servo speed (limits jitter)
+
+// ---- Accelerometer mounting ----
+// Which ICM-20948 axis points along the rocket: 'X', 'Y' or 'Z'.
+// Test: stand the board nose-up the way it will fly and watch Serial output.
+// The axis that reads about +1 g is the right one. If it reads -1 g, set ACCEL_SIGN = -1.
+// (If the PCB lies along the rocket, this is usually X or Y, not Z.)
+const char  ACCEL_AXIS = 'Z';
+const float ACCEL_SIGN = 1.0f;
+
+// ---- Drag model (MOST IMPORTANT TO TUNE) ----
+// k = 0.5 * airDensity * Cd * Area / mass     (units: 1/meter)
+// Drag deceleration = k * velocity^2.
+// K_BASE_DEFAULT : your rocket with brakes CLOSED (get it from OpenRocket,
+//                  the code then learns the real value in flight).
+// BRAKE_DELTA_K  : EXTRA k added when brakes are FULLY open.
+//                  Estimate: 0.5 * 1.2 * (Cd_brake * brake_area_m2) / mass_kg
+//                  Better: fly once, check "k_est" in the log with brakes closed vs open.
+// Values below come from last year's tables (mass 0.489 kg, rho 1.22):
+//   closed: Cd*A = 0.3*0.003 = 0.0009  -> k = 0.5*1.22*0.0009/0.489 = 0.0011
+//   open  : Cd*A = 1.1*0.011 = 0.0121  -> k = 0.0151, so delta = 0.0140
+// Those tables were marked "tune later", so treat these as placeholders.
+const float K_BASE_DEFAULT = 0.0011f;
+const float BRAKE_DELTA_K  = 0.0140f;
+
+// ---- Kalman filter noise (tune from logged data) ----
+const float BARO_VAR  = 0.25f;  // barometer noise variance (m^2).  0.5 m std dev
+const float ACCEL_VAR = 0.50f;  // accelerometer noise variance ((m/s^2)^2)
+
+// ---- Flight detection ----
+const float LAUNCH_G          = 3.0f;   // above this for LAUNCH_COUNT loops = launch
+const int   LAUNCH_COUNT      = 5;
+const float BURNOUT_G         = 0.0f;   // below this (drag pushes backwards) = burnout
+const int   BURNOUT_COUNT     = 5;
+const unsigned long BRAKE_DELAY_MS = 500;  // wait after burnout before brakes may move
+const float MIN_BRAKE_SPEED   = 25.0f;  // m/s, don't use brakes below this speed
+const int   APOGEE_COUNT      = 5;      // loops with negative velocity = apogee
+
+// =====================================================================
+//  CONSTANTS AND GLOBALS (usually no need to change)
+// =====================================================================
+const float G          = 9.80665f;          // m/s^2
+const float FT_TO_M    = 0.3048f;
+const float TARGET_M   = TARGET_APOGEE_FT * FT_TO_M;
+const unsigned long LOOP_US = 10000;        // 100 Hz main loop
+const int   BARO_EVERY_N_LOOPS = 2;         // baro runs at 50 Hz
+
+enum FlightState { PAD, BOOST, COAST, DESCENT, LANDED };
+FlightState state = PAD;
+const char* stateNames[] = {"PAD", "BOOST", "COAST", "DESCENT", "LANDED"};
+
+BMP581 baro;
+ICM_20948_I2C imu;
+Servo brakeServo;
+File logFile;
+
+// Sensor values
+float groundPressure = 101325.0f;  // Pa
+float padG = 1.0f;                 // what the accel reads (in g) when sitting on pad
+float accelG = 1.0f;               // latest accel reading along rocket axis (g)
+float accelGFiltered = 1.0f;       // smoothed version, used for drag estimate
+float baroAlt = 0.0f;              // altitude from barometer (m)
+
+// Kalman filter: state = [height, velocity], P = 2x2 uncertainty matrix
+float kfH = 0.0f, kfV = 0.0f;
+float P00 = 1.0f, P01 = 0.0f, P10 = 0.0f, P11 = 1.0f;
+
+// Drag + control
+float kEst = K_BASE_DEFAULT;   // live estimate of TOTAL k (includes current brake drag)
+float predictedApogee = 0.0f;  // meters
+float deployCmd = 0.0f;        // what the controller wants (0..1)
+float deployActual = 0.0f;     // what the servo is currently at (0..1)
+
+// Counters / timers
+int launchCounter = 0, burnoutCounter = 0, apogeeCounter = 0;
+unsigned long burnoutTimeMs = 0;
+unsigned long launchTimeMs = 0;
+unsigned long landedTimerMs = 0;
+unsigned long lastFlushMs = 0;
+unsigned long nextLoopUs = 0;
+int loopCount = 0;
+float maxAlt = 0.0f;
+
+// =====================================================================
+//  HELPER FUNCTIONS
+// =====================================================================
+
+// Stop everything and keep brakes closed if hardware is broken.
+void fatalError(const char* msg) {
+  Serial.println(msg);
+  brakeServo.write(SERVO_RETRACTED_DEG);
+  while (true) { delay(1000); }
+}
+
+// Convert pressure (Pa) to altitude above ground (m)
+float pressureToAltitude(float pressurePa) {
+  return 44330.77f * (1.0f - pow(pressurePa / groundPressure, 0.190263f));
+}
+
+// Read accelerometer (in g) along the rocket axis. Keeps last value if no new data.
+void readAccelG() {
+  if (imu.dataReady()) {
+    imu.getAGMT();
+    float mg;                                     // the library reports milli-g
+    if (ACCEL_AXIS == 'X')      mg = imu.accX();
+    else if (ACCEL_AXIS == 'Y') mg = imu.accY();
+    else                        mg = imu.accZ();
+    accelG = mg * ACCEL_SIGN / 1000.0f;
+  }
+}
+
+// Read barometer, returns true if successful
+bool readBaro() {
+  bmp5_sensor_data data;
+  if (baro.getSensorData(&data) == BMP5_OK) {
+    baroAlt = pressureToAltitude(data.pressure);
+    return true;
+  }
+  return false;
+}
+
+// ---------------------- KALMAN FILTER ----------------------
+// Step 1: PREDICT using acceleration (runs every loop)
+void kalmanPredict(float accelUp, float dt) {
+  // Move the state forward with basic physics
+  kfH += kfV * dt + 0.5f * accelUp * dt * dt;
+  kfV += accelUp * dt;
+
+  // Grow uncertainty: P = F*P*F^T + Q
+  float dt2 = dt * dt;
+  float n00 = P00 + dt * (P10 + P01) + dt2 * P11;
+  float n01 = P01 + dt * P11;
+  float n10 = P10 + dt * P11;
+  float n11 = P11;
+  P00 = n00 + ACCEL_VAR * dt2 * dt2 / 4.0f;
+  P01 = n01 + ACCEL_VAR * dt2 * dt / 2.0f;
+  P10 = n10 + ACCEL_VAR * dt2 * dt / 2.0f;
+  P11 = n11 + ACCEL_VAR * dt2;
+}
+
+// Step 2: UPDATE using a barometer height (runs when a new baro reading arrives)
+void kalmanUpdate(float measuredHeight) {
+  float innovation = measuredHeight - kfH;  // how wrong our prediction was
+  float S = P00 + BARO_VAR;
+  float K0 = P00 / S;                        // Kalman gain for height
+  float K1 = P10 / S;                        // Kalman gain for velocity
+
+  kfH += K0 * innovation;
+  kfV += K1 * innovation;
+
+  float p00 = P00, p01 = P01;
+  P00 = p00 - K0 * p00;
+  P01 = p01 - K0 * p01;
+  P10 = P10 - K1 * p00;
+  P11 = P11 - K1 * p01;
+}
+
+// ---------------------- APOGEE PREDICTION ----------------------
+// Rocket going up with gravity AND drag proportional to v^2:
+//   dv/dt = -g - k*v^2
+// Solving this gives the extra height still to climb:
+//   extra = ln(1 + k*v^2/g) / (2k)
+float predictApogee(float height, float velocity, float k) {
+  if (velocity <= 0.0f) return height;
+  if (k < 0.00001f) k = 0.00001f;
+  return height + log(1.0f + k * velocity * velocity / G) / (2.0f * k);
+}
+
+// ---------------------- CONTROLLER ----------------------
+// Find the brake deployment (0..1) that makes predicted apogee = target.
+// More brakes = lower apogee, so we can binary search ("bisection").
+float computeDeployment(float height, float velocity) {
+  // Drag of the rocket WITHOUT brakes = total estimate minus what brakes add now
+  float kNoBrakes = kEst - deployActual * BRAKE_DELTA_K;
+  if (kNoBrakes < 0.0002f) kNoBrakes = 0.0002f;
+
+  // Already going to land at or below target with brakes closed
+  if (predictApogee(height, velocity, kNoBrakes) <= TARGET_M) return 0.0f;
+  // Even full brakes can't bring it down enough
+  if (predictApogee(height, velocity, kNoBrakes + BRAKE_DELTA_K) >= TARGET_M) return 1.0f;
+
+  float lo = 0.0f, hi = 1.0f;
+  for (int i = 0; i < 12; i++) {
+    float mid = 0.5f * (lo + hi);
+    if (predictApogee(height, velocity, kNoBrakes + mid * BRAKE_DELTA_K) > TARGET_M) {
+      lo = mid;   // still too high, need more brakes
+    } else {
+      hi = mid;   // too low, need fewer brakes
+    }
+  }
+  return 0.5f * (lo + hi);
+}
+
+// Learn the real drag from flight data.
+// In coast, the accelerometer ONLY feels drag (gravity cancels in free fall),
+// so  accelG * g = -k * v^2   ->   k = -accelG * g / v^2
+void updateDragEstimate() {
+  if (kfV < MIN_BRAKE_SPEED) return;
+  float kMeasured = -accelGFiltered * G / (kfV * kfV);
+  if (kMeasured < 0.0f) kMeasured = 0.0f;
+  if (kMeasured > 0.02f) kMeasured = 0.02f;
+  kEst += 0.05f * (kMeasured - kEst);   // slow smoothing
+}
+
+// Move servo toward the command, but not faster than the speed limit.
+void updateServo(float dt) {
+  float maxStep = (SERVO_SPEED_DEG_PER_S / (float)(SERVO_DEPLOYED_DEG - SERVO_RETRACTED_DEG)) * dt;
+  float diff = deployCmd - deployActual;
+  if (diff > maxStep) diff = maxStep;
+  if (diff < -maxStep) diff = -maxStep;
+  deployActual += diff;
+  int angle = SERVO_RETRACTED_DEG + (int)(deployActual * (SERVO_DEPLOYED_DEG - SERVO_RETRACTED_DEG) + 0.5f);
+  brakeServo.write(angle);
+}
+
+// ---------------------- SD LOGGING ----------------------
+void openLogFile() {
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD card failed (flight continues without logging)");
+    return;
+  }
+  char name[16];
+  for (int i = 0; i < 1000; i++) {
+    snprintf(name, sizeof(name), "FLT%03d.CSV", i);
+    if (!SD.exists(name)) break;
+  }
+  logFile = SD.open(name, FILE_WRITE);
+  if (logFile) {
+    logFile.println("time_ms,state,baro_alt_m,kf_alt_m,kf_vel_mps,accel_g,pred_apogee_m,k_est,deploy_cmd,deploy_actual");
+    Serial.print("Logging to "); Serial.println(name);
+  }
+}
+
+void logData() {
+  if (!logFile) return;
+  logFile.print(millis());           logFile.print(',');
+  logFile.print(stateNames[state]);  logFile.print(',');
+  logFile.print(baroAlt, 2);         logFile.print(',');
+  logFile.print(kfH, 2);             logFile.print(',');
+  logFile.print(kfV, 2);             logFile.print(',');
+  logFile.print(accelG, 3);          logFile.print(',');
+  logFile.print(predictedApogee, 2); logFile.print(',');
+  logFile.print(kEst, 6);            logFile.print(',');
+  logFile.print(deployCmd, 3);       logFile.print(',');
+  logFile.println(deployActual, 3);
+
+  // Flush a few times per second so data survives a crash or power loss
+  if (millis() - lastFlushMs > 250) {
+    logFile.flush();
+    lastFlushMs = millis();
+  }
+}
+
+// =====================================================================
+//  SETUP
+// =====================================================================
+// ZERO THE SENSORS: sets "height = 0" at the current pressure and records the
+// accelerometer's resting value. Rocket must be still and upright.
+// Runs at power-up AND whenever the button is pressed on the pad.
+void calibrateOnPad() {
+  Serial.println("Zeroing... keep rocket still");
+  delay(500);
+  float pSum = 0.0f, aSum = 0.0f;
+  int n = 0;
+  while (n < 100) {
+    bmp5_sensor_data data;
+    if (baro.getSensorData(&data) == BMP5_OK) {
+      pSum += data.pressure;
+      readAccelG();
+      aSum += accelG;
+      n++;
+    }
+    delay(20);
+  }
+  groundPressure = pSum / n;
+  padG = aSum / n;
+  accelGFiltered = padG;
+  kfH = 0.0f; kfV = 0.0f;
+  P00 = 1.0f; P01 = 0.0f; P10 = 0.0f; P11 = 1.0f;
+
+  Serial.print("Ground pressure (Pa): "); Serial.println(groundPressure);
+  Serial.print("Pad accel (g): ");        Serial.println(padG);
+  nextLoopUs = micros() + LOOP_US;   // restart the loop timer after the delay
+}
+
+// =====================================================================
+//  SETUP
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+
+  // Servo first, so brakes are closed from the start
+  brakeServo.attach(SERVO_PIN);
+  brakeServo.write(SERVO_RETRACTED_DEG);
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  // Barometer
+  // The address depends on how the SDO pin is tied, so try both (0x46 first, then 0x47).
+  if (baro.beginI2C(BMP581_I2C_ADDRESS_SECONDARY) != BMP5_OK) {
+    if (baro.beginI2C(BMP581_I2C_ADDRESS_DEFAULT) != BMP5_OK) fatalError("BMP581 not found");
+  }
+  baro.setODRFrequency(BMP5_ODR_50_HZ);
+
+  // Accelerometer
+  imu.begin(Wire, 1);   // 1 = address 0x69. Use 0 if your board is at 0x68
+  if (imu.status != ICM_20948_Stat_Ok) fatalError("ICM-20948 not found");
+  ICM_20948_fss_t fss;
+  fss.a = gpm16;        // +/-16 g range (motor thrust can be high)
+  fss.g = dps2000;
+  imu.setFullScale((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), fss);
+
+  openLogFile();
+
+  pinMode(BUTTON_PIN, BUTTON_ACTIVE_LOW ? INPUT_PULLUP : INPUT);
+
+  // Zero at power-up (rocket must be still and upright)
+  delay(500);
+  calibrateOnPad();
+  Serial.println("READY");
+
+  nextLoopUs = micros() + LOOP_US;
+}
+
+// =====================================================================
+//  MAIN LOOP (runs at 100 Hz)
+// =====================================================================
+void loop() {
+  // ---- Wait for the next 10 ms tick ----
+  while ((int32_t)(micros() - nextLoopUs) < 0) { }
+  nextLoopUs += LOOP_US;
+  if ((int32_t)(micros() - nextLoopUs) > 50000) nextLoopUs = micros() + LOOP_US; // recover if we fell behind
+  const float dt = LOOP_US / 1000000.0f;
+
+  // ---- 1. Read sensors ----
+  readAccelG();
+  accelGFiltered += 0.2f * (accelG - accelGFiltered);
+
+  // ---- 2. Kalman filter ----
+  // Vertical acceleration = specific force minus gravity.
+  // (padG is the pad reading, so it also cancels any small tilt/offset)
+  float accelUp = (accelG - padG) * G;
+  kalmanPredict(accelUp, dt);
+
+  loopCount++;
+  if (loopCount % BARO_EVERY_N_LOOPS == 0) {
+    if (readBaro()) kalmanUpdate(baroAlt);
+  }
+  if (kfH > maxAlt) maxAlt = kfH;
+
+  // ---- 3. Flight state machine ----
+  switch (state) {
+
+    case PAD:
+      deployCmd = 0.0f;
+      // Zero button: only works on the pad, never in flight
+      if (digitalRead(BUTTON_PIN) == (BUTTON_ACTIVE_LOW ? LOW : HIGH)) {
+        calibrateOnPad();
+        launchCounter = 0;
+        break;
+      }
+      // Slowly follow weather drift in ground pressure while waiting
+      if (loopCount % BARO_EVERY_N_LOOPS == 0) {
+        bmp5_sensor_data d;
+        if (baro.getSensorData(&d) == BMP5_OK) {
+          groundPressure += 0.0005f * (d.pressure - groundPressure);
+        }
+      }
+      if (accelG > LAUNCH_G) launchCounter++; else launchCounter = 0;
+      if (launchCounter >= LAUNCH_COUNT) {
+        state = BOOST;
+        launchTimeMs = millis();
+        Serial.println("LAUNCH");
+      }
+      break;
+
+    case BOOST:
+      deployCmd = 0.0f;
+      // Burnout: accelerometer goes negative (only drag is acting)
+      if (accelG < BURNOUT_G) burnoutCounter++; else burnoutCounter = 0;
+      if (burnoutCounter >= BURNOUT_COUNT) {
+        state = COAST;
+        burnoutTimeMs = millis();
+        Serial.println("BURNOUT");
+      }
+      break;
+
+    case COAST:
+      // Learn drag, predict apogee, decide brake amount
+      if (millis() - burnoutTimeMs > BRAKE_DELAY_MS && kfV > MIN_BRAKE_SPEED) {
+        updateDragEstimate();
+        deployCmd = computeDeployment(kfH, kfV);
+        float kNoBrakes = kEst - deployActual * BRAKE_DELTA_K;
+        predictedApogee = predictApogee(kfH, kfV, kNoBrakes + deployActual * BRAKE_DELTA_K);
+      } else {
+        deployCmd = 0.0f;
+        predictedApogee = predictApogee(kfH, kfV, kEst);
+      }
+      // Apogee detection: velocity goes negative
+      if (kfV < 0.0f) apogeeCounter++; else apogeeCounter = 0;
+      if (apogeeCounter >= APOGEE_COUNT) {
+        state = DESCENT;
+        deployCmd = 0.0f;   // close brakes for the descent
+        Serial.print("APOGEE (m): "); Serial.println(kfH);
+      }
+      break;
+
+    case DESCENT:
+      deployCmd = 0.0f;
+      // Landed: barely moving for 5 seconds
+      if (fabs(kfV) < 1.0f && kfH < 15.0f) {
+        if (landedTimerMs == 0) landedTimerMs = millis();
+        if (millis() - landedTimerMs > 5000) {
+          state = LANDED;
+          if (logFile) { logFile.flush(); logFile.close(); }
+          Serial.print("LANDED. Max alt (ft): "); Serial.println(maxAlt / FT_TO_M);
+        }
+      } else {
+        landedTimerMs = 0;
+      }
+      break;
+
+    case LANDED:
+      deployCmd = 0.0f;
+      break;
+  }
+
+  // ---- 4. Safety: if something is clearly wrong, close the brakes ----
+  if (state != COAST) deployCmd = 0.0f;
+  if (deployCmd < 0.0f) deployCmd = 0.0f;
+  if (deployCmd > 1.0f) deployCmd = 1.0f;
+
+  // ---- 5. Move servo and log ----
+  updateServo(dt);
+  if (state != LANDED) logData();
+}
